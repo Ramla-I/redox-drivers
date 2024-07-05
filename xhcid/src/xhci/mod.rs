@@ -9,13 +9,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use std::{mem, process, slice, sync::atomic, task, thread};
 
+use syscall::PAGE_SIZE;
+use syscall::error::{Error, Result, EBADF, EBADMSG, ENOENT, EIO};
+use syscall::io::Io;
+
 use chashmap::CHashMap;
+use common::dma::Dma;
 use crossbeam_channel::{Receiver, Sender};
 use log::{debug, error, info, trace, warn};
 use serde::Deserialize;
-use syscall::error::{Error, Result, EBADF, EBADMSG, ENOENT, EIO};
-use syscall::flag::{O_RDONLY, PhysallocFlags};
-use syscall::io::{Dma, Io, PhysBox};
 
 use crate::usb;
 
@@ -67,7 +69,6 @@ pub enum InterruptMethod {
 
 pub struct MsixInfo {
     pub virt_table_base: NonNull<MsixTableEntry>,
-    pub virt_pba_base: NonNull<u64>,
     pub capability: MsixCapability,
 }
 impl MsixInfo {
@@ -78,30 +79,20 @@ impl MsixInfo {
         assert!(k < self.capability.table_size() as usize);
         unsafe { self.table_entry_pointer_unchecked(k) }
     }
-    pub unsafe fn pba_pointer_unchecked(&mut self, k: usize) -> &mut u64 {
-        &mut *self.virt_pba_base.as_ptr().offset(k as isize)
-    }
-    pub fn pba_pointer(&mut self, k: usize) -> &mut u64 {
-        assert!(k < self.capability.table_size() as usize);
-        unsafe { self.pba_pointer_unchecked(k) }
-    }
-    pub fn pba(&mut self, k: usize) -> bool {
-        let byte = k / 64;
-        let bit = k % 64;
-        *self.pba_pointer(byte) & (1 << bit) != 0
-    }
 }
 
 impl Xhci {
     /// Gets descriptors, before the port state is initiated.
     async fn get_desc_raw<T>(&self, port: usize, slot: u8, kind: usb::DescriptorKind, index: u8, desc: &mut Dma<T>) -> Result<()> {
         let len = mem::size_of::<T>();
+        log::debug!("get_desc_raw port {} slot {} kind {:?} index {} len {}", port, slot, kind, index, len);
 
         let future = {
             let mut port_state = self.port_states.get_mut(&port).ok_or(Error::new(ENOENT))?;
             let ring = port_state.endpoint_states.get_mut(&0).ok_or(Error::new(EIO))?.ring().expect("no ring for the default control pipe");
 
-            let (cmd, cycle) = ring.next();
+            let first_index = ring.next_index();
+            let (cmd, cycle) = (&mut ring.trbs[first_index], ring.cycle);
             cmd.setup(
                 usb::Setup::get_descriptor(kind, index, 0, len as u16),
                 TransferKind::In,
@@ -125,6 +116,7 @@ impl Xhci {
             self.next_transfer_event_trb(
                 RingId::default_control_pipe(port as u8),
                 &ring,
+                &ring.trbs[first_index],
                 &ring.trbs[last_index],
                 EventDoorbell::new(self, usize::from(slot), Self::def_control_endp_doorbell())
             )
@@ -138,6 +130,12 @@ impl Xhci {
 
         self.event_handler_finished();
         Ok(())
+    }
+
+    async fn fetch_dev_desc_8_byte(&self, port: usize, slot: u8) -> Result<usb::DeviceDescriptor8Byte> {
+        let mut desc = unsafe { self.alloc_dma_zeroed::<usb::DeviceDescriptor8Byte>()? };
+        self.get_desc_raw(port, slot, usb::DescriptorKind::Device, 0, &mut desc).await?;
+        Ok(*desc)
     }
 
     async fn fetch_dev_desc(&self, port: usize, slot: u8) -> Result<usb::DeviceDescriptor> {
@@ -174,7 +172,7 @@ impl Xhci {
 pub struct Xhci {
     // immutable
     cap: &'static CapabilityRegs,
-    page_size: usize,
+    //page_size: usize,
 
     // XXX: It would be really useful to be able to mutably access individual elements of a slice,
     // without having to wrap every element in a lock (which wouldn't work since they're packed).
@@ -217,10 +215,28 @@ unsafe impl Sync for Xhci {}
 struct PortState {
     slot: u8,
     cfg_idx: Option<u8>,
-    if_idx: Option<u8>,
     input_context: Mutex<Dma<InputContext>>,
     dev_desc: Option<DevDesc>,
     endpoint_states: BTreeMap<u8, EndpointState>,
+}
+
+impl PortState {
+    //TODO: fetch using endpoint number instead
+    fn get_endp_desc(&self, endp_idx: u8) -> Option<&EndpDesc> {
+        let cfg_idx = self.cfg_idx?;
+        let config_desc = self.dev_desc.as_ref()?
+            .config_descs.get(cfg_idx as usize)?;
+        let mut endp_count = 0;
+        for if_desc in config_desc.interface_descs.iter() {
+            for endp_desc in if_desc.endpoints.iter() {
+                if endp_idx == endp_count {
+                    return Some(endp_desc);
+                }
+                endp_count += 1;
+            }
+        }
+        None
+    }
 }
 
 pub(crate) enum RingOrStreams {
@@ -246,12 +262,7 @@ impl Xhci {
         let cap = unsafe { &mut *(address as *mut CapabilityRegs) };
         debug!("CAP REGS BASE {:X}", address);
 
-        let page_size = {
-            let memory_fd = syscall::open("memory:", O_RDONLY)?;
-            let mut stat = syscall::data::StatVfs::default();
-            syscall::fstatvfs(memory_fd, &mut stat)?;
-            stat.f_bsize as usize
-        };
+        //let page_size = ...
 
         let op_base = address + cap.len.read() as usize;
         let op = unsafe { &mut *(op_base as *mut OperationalRegs) };
@@ -304,7 +315,7 @@ impl Xhci {
 
         // Create the command ring with 4096 / 16 (TRB size) entries, so that it uses all of the
         // DMA allocation (which is at least a 4k page).
-        let entries_per_page = page_size / mem::size_of::<Trb>();
+        let entries_per_page = PAGE_SIZE / mem::size_of::<Trb>();
         let cmd = Ring::new(cap.ac64(), entries_per_page, true)?;
 
         let (irq_reactor_sender, irq_reactor_receiver) = crossbeam_channel::unbounded();
@@ -313,7 +324,7 @@ impl Xhci {
             base: address as *const u8,
 
             cap,
-            page_size,
+            //page_size,
 
             op: Mutex::new(op),
             ports: Mutex::new(ports),
@@ -365,13 +376,15 @@ impl Xhci {
         // Set device context address array pointer
         let dcbaap = self.dev_ctx.dcbaap();
         debug!("Writing DCBAAP: {:X}", dcbaap);
-        self.op.get_mut().unwrap().dcbaap.write(dcbaap as u64);
+        self.op.get_mut().unwrap().dcbaap_low.write(dcbaap as u32);
+        self.op.get_mut().unwrap().dcbaap_high.write((dcbaap as u64 >> 32) as u32);
 
         // Set command ring control register
         let crcr = self.cmd.get_mut().unwrap().register();
         assert_eq!(crcr & 0xFFFF_FFFF_FFFF_FFC1, crcr, "unaligned CRCR");
         debug!("Writing CRCR: {:X}", crcr);
-        self.op.get_mut().unwrap().crcr.write(crcr as u64);
+        self.op.get_mut().unwrap().crcr_low.write(crcr as u32);
+        self.op.get_mut().unwrap().crcr_high.write((crcr as u64 >> 32) as u32);
 
         // Set event ring segment table registers
         debug!("Interrupter 0: {:p}", self.run.get_mut().unwrap().ints.as_ptr());
@@ -384,11 +397,13 @@ impl Xhci {
 
             let erdp = self.primary_event_ring.get_mut().unwrap().erdp();
             debug!("Writing ERDP: {:X}", erdp);
-            int.erdp.write(erdp as u64 | (1 << 3));
+            int.erdp_low.write(erdp as u32 | (1 << 3));
+            int.erdp_high.write((erdp as u64 >> 32) as u32);
 
             let erstba = self.primary_event_ring.get_mut().unwrap().erstba();
             debug!("Writing ERSTBA: {:X}", erstba);
-            int.erstba.write(erstba as u64);
+            int.erstba_low.write(erstba as u32);
+            int.erstba_high.write((erstba as u64 >> 32) as u32);
 
             debug!("Writing IMODC and IMODI: {} and {}", 0, 0);
             int.imod.write(0);
@@ -418,10 +433,7 @@ impl Xhci {
 
         info!("XHCI initialized.");
 
-        if self.cap.cic() {
-            self.op.get_mut().unwrap().set_cie(true);
-        }
-
+        self.op.get_mut().unwrap().set_cie(self.cap.cic());
 
         // Reset ports
         {
@@ -453,7 +465,7 @@ impl Xhci {
         if buf_count == 0 {
             return Ok(());
         }
-        let scratchpad_buf_arr = ScratchpadBufferArray::new(self.cap.ac64(), self.page_size,buf_count)?;
+        let scratchpad_buf_arr = ScratchpadBufferArray::new(self.cap.ac64(), buf_count)?;
         self.dev_ctx.dcbaa[0] = scratchpad_buf_arr.register() as u64;
         debug!("Setting up {} scratchpads, at {:#0x}", buf_count, scratchpad_buf_arr.register());
         self.scratchpad_buf_arr = Some(scratchpad_buf_arr);
@@ -484,26 +496,16 @@ impl Xhci {
     pub fn slot_state(&self, slot: usize) -> u8 {
         self.dev_ctx.contexts[slot].slot.state()
     }
-    pub unsafe fn alloc_phys(ac64: bool, byte_count: usize) -> Result<PhysBox> {
-        let flags = if ac64 {
-            PhysallocFlags::SPACE_64
-        } else {
-            PhysallocFlags::SPACE_32
-        };
-        PhysBox::new_with_flags(byte_count, flags)
-    }
-    fn page_align(size: usize) -> usize {
-        // TODO: PAGE_SIZE
-        (size+4095)/4096*4096
-    }
-    pub unsafe fn alloc_dma_zeroed_raw<T>(ac64: bool) -> Result<Dma<T>> {
-        Ok(Dma::from_physbox_zeroed(Self::alloc_phys(ac64, Self::page_align(mem::size_of::<T>()))?)?.assume_init())
+    pub unsafe fn alloc_dma_zeroed_raw<T>(_ac64: bool) -> Result<Dma<T>> {
+        // TODO: ac64
+        Ok(Dma::zeroed()?.assume_init())
     }
     pub unsafe fn alloc_dma_zeroed<T>(&self) -> Result<Dma<T>> {
         Self::alloc_dma_zeroed_raw(self.cap.ac64())
     }
-    pub unsafe fn alloc_dma_zeroed_unsized_raw<T>(ac64: bool, count: usize) -> Result<Dma<[T]>> {
-        Ok(Dma::from_physbox_zeroed_unsized(Self::alloc_phys(ac64, Self::page_align(mem::size_of::<T>() * count))?, count)?.assume_init())
+    pub unsafe fn alloc_dma_zeroed_unsized_raw<T>(_ac64: bool, count: usize) -> Result<Dma<[T]>> {
+        // TODO: ac64
+        Ok(Dma::zeroed_slice(count)?.assume_init())
     }
     pub unsafe fn alloc_dma_zeroed_unsized<T>(&self, count: usize) -> Result<Dma<[T]>> {
         Self::alloc_dma_zeroed_unsized_raw(self.cap.ac64(), count)
@@ -535,12 +537,24 @@ impl Xhci {
 
                 debug!("Slot type: {}", slot_ty);
                 debug!("Enabling slot.");
-                let slot = self.enable_port_slot(slot_ty).await?;
+                let slot = match self.enable_port_slot(slot_ty).await {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        error!("Failed to enable slot for port {}: {}", i, err);
+                        continue;
+                    }
+                };
 
                 info!("Enabled port {}, which the xHC mapped to {}", i, slot);
 
                 let mut input = unsafe { self.alloc_dma_zeroed::<InputContext>()? };
-                let mut ring = self.address_device(&mut input, i, slot_ty, slot, speed).await?;
+                let mut ring = match self.address_device(&mut input, i, slot_ty, slot, speed).await {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        error!("Failed to address device for port {}: {}", i, err);
+                        continue;
+                    }
+                };
                 debug!("Addressed device");
 
                 // TODO: Should the descriptors be cached in PortState, or refetched?
@@ -550,7 +564,6 @@ impl Xhci {
                     input_context: Mutex::new(input),
                     dev_desc: None,
                     cfg_idx: None,
-                    if_idx: None,
                     endpoint_states: std::iter::once((
                         0,
                         EndpointState {
@@ -561,6 +574,16 @@ impl Xhci {
                     .collect::<BTreeMap<_, _>>(),
                 };
                 self.port_states.insert(i, port_state);
+
+                // Ensure correct packet size is used
+                let dev_desc_8_byte = self.fetch_dev_desc_8_byte(i, slot).await?;
+                {
+                    let mut port_state = self.port_states.get_mut(&i).unwrap();
+
+                    let mut input = port_state.input_context.lock().unwrap();
+
+                    self.update_max_packet_size(&mut *input, slot, dev_desc_8_byte).await?;
+                }
 
                 let dev_desc = self.get_desc(i, slot).await?;
                 self.port_states.get_mut(&i).unwrap().dev_desc = Some(dev_desc);
@@ -580,6 +603,33 @@ impl Xhci {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    pub async fn update_max_packet_size(
+        &self,
+        input_context: &mut Dma<InputContext>,
+        slot_id: u8,
+        dev_desc: usb::DeviceDescriptor8Byte
+    ) -> Result<()> {
+        let new_max_packet_size = if dev_desc.major_usb_vers() == 2 {
+            u32::from(dev_desc.packet_size)
+        } else {
+            1u32 << dev_desc.packet_size
+        };
+        let endp_ctx = &mut input_context.device.endpoints[0];
+        let mut b = endp_ctx.b.read();
+        b &= 0x0000_FFFF;
+        b |= (new_max_packet_size) << 16;
+        endp_ctx.b.write(b);
+
+        let (event_trb, command_trb) = self.execute_command(|trb, cycle| {
+            trb.evaluate_context(slot_id, input_context.physical(), false, cycle)
+        }).await;
+
+        self::scheme::handle_event_trb("EVALUATE_CONTEXT", &event_trb, &command_trb)?;
+        self.event_handler_finished();
 
         Ok(())
     }
@@ -604,14 +654,12 @@ impl Xhci {
         b |= (new_max_packet_size) << 16;
         endp_ctx.b.write(b);
 
-        /*TODO: this causes issues on real hardware, maybe it should only be used on USB 2?
         let (event_trb, command_trb) = self.execute_command(|trb, cycle| {
             trb.evaluate_context(slot_id, input_context.physical(), false, cycle)
         }).await;
 
         self::scheme::handle_event_trb("EVALUATE_CONTEXT", &event_trb, &command_trb)?;
         self.event_handler_finished();
-        */
 
         Ok(())
     }
@@ -710,7 +758,7 @@ impl Xhci {
         }).await;
 
         if event_trb.completion_code() != TrbCompletionCode::Success as u8 {
-            error!("Failed to address device at slot {} (port {})", slot, i);
+            error!("Failed to address device at slot {} (port {}), completion code 0x{:X}", slot, i, event_trb.completion_code());
             self.event_handler_finished();
             return Err(Error::new(EIO));
         }
@@ -747,10 +795,10 @@ impl Xhci {
         if self.uses_msi() || self.uses_msix() {
             // Since using MSI and MSI-X implies having no IRQ sharing whatsoever, the IP bit
             // doesn't have to be touched.
-            trace!("Successfully received MSI/MSI-X interrupt, IP={}, EHB={}", runtime_regs.ints[0].iman.readf(1), runtime_regs.ints[0].erdp.readf(3));
+            trace!("Successfully received MSI/MSI-X interrupt, IP={}, EHB={}", runtime_regs.ints[0].iman.readf(1), runtime_regs.ints[0].erdp_low.readf(3));
             true
         } else if runtime_regs.ints[0].iman.readf(1) {
-            trace!("Successfully received INTx# interrupt, IP={}, EHB={}", runtime_regs.ints[0].iman.readf(1), runtime_regs.ints[0].erdp.readf(3));
+            trace!("Successfully received INTx# interrupt, IP={}, EHB={}", runtime_regs.ints[0].iman.readf(1), runtime_regs.ints[0].erdp_low.readf(3));
             // If MSI and/or MSI-X are not used, the interrupt might have to be shared, and thus there is
             // a special register to specify whether the IRQ actually came from the xHC.
             runtime_regs.ints[0].iman.writef(1, true);
@@ -771,47 +819,52 @@ impl Xhci {
 
         let ps = self.port_states.get(&port).unwrap();
 
-        let ifdesc = &ps
+        //TODO: support choosing config?
+        let config_desc = &ps
             .dev_desc
-            .as_ref().ok_or(Error::new(EBADF))?
+            .as_ref().ok_or_else(|| {
+                log::warn!("Missing device descriptor");
+                Error::new(EBADF)
+            })?
             .config_descs
             .first()
-            .ok_or(Error::new(EBADF))?
-            .interface_descs
-            .first()
-            .ok_or(Error::new(EBADF))?;
+            .ok_or_else(|| {
+                log::warn!("Missing config descriptor");
+                Error::new(EBADF)
+            })?;
 
         let drivers_usercfg: &DriversConfig = &DRIVERS_CONFIG;
 
-        if let Some(driver) = drivers_usercfg.drivers.iter().find(|driver| {
-            driver.class == ifdesc.class
-                && driver
-                    .subclass()
-                    .map(|subclass| subclass == ifdesc.sub_class)
-                    .unwrap_or(true)
-        }) {
-            info!("Loading subdriver \"{}\"", driver.name);
-            let (command, args) = driver.command.split_first().ok_or(Error::new(EBADMSG))?;
+        //TODO: allow spawning on all interfaces (will require fixing port state)
+        for ifdesc in config_desc.interface_descs.iter().take(1) {
+            if let Some(driver) = drivers_usercfg.drivers.iter().find(|driver| {
+                driver.class == ifdesc.class
+                    && driver
+                        .subclass()
+                        .map(|subclass| subclass == ifdesc.sub_class)
+                        .unwrap_or(true)
+            }) {
+                info!("Loading subdriver \"{}\"", driver.name);
+                let (command, args) = driver.command.split_first().ok_or(Error::new(EBADMSG))?;
 
-            let if_proto = ifdesc.protocol;
-
-            let process = process::Command::new(command)
-                .args(
-                    args.into_iter()
-                        .map(|arg| {
-                            arg.replace("$SCHEME", &self.scheme_name)
-                                .replace("$PORT", &format!("{}", port))
-                                .replace("$IF_PROTO", &format!("{}", if_proto))
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .stdin(process::Stdio::null())
-                .spawn()
-                .or(Err(Error::new(ENOENT)))?;
-            self.drivers.insert(port, process);
-        } else {
-            warn!("No driver for USB class {}.{}", ifdesc.class, ifdesc.sub_class);
-            return Err(Error::new(ENOENT));
+                let process = process::Command::new(command)
+                    .args(
+                        args.into_iter()
+                            .map(|arg| {
+                                arg.replace("$SCHEME", &self.scheme_name)
+                                    .replace("$PORT", &format!("{}", port))
+                                    .replace("$IF_NUM", &format!("{}", ifdesc.number))
+                                    .replace("$IF_PROTO", &format!("{}", ifdesc.protocol))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .stdin(process::Stdio::null())
+                    .spawn()
+                    .or(Err(Error::new(ENOENT)))?;
+                self.drivers.insert(port, process);
+            } else {
+                warn!("No driver for USB class {}.{}", ifdesc.class, ifdesc.sub_class);
+            }
         }
 
         Ok(())

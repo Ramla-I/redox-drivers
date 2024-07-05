@@ -1,4 +1,4 @@
-#![feature(if_let_guard)]
+#![feature(if_let_guard, int_roundings)]
 
 use std::convert::TryFrom;
 use std::io::{self, prelude::*};
@@ -81,8 +81,8 @@ fn setup_logging() -> Option<&'static RedoxLogger> {
 fn daemon(daemon: redox_daemon::Daemon) -> ! {
     setup_logging();
 
-    let rxsdt_raw_data: Arc<[u8]> = std::fs::read("kernel/acpi:rxsdt")
-        .expect("acpid: failed to read `kernel/acpi:rxsdt`")
+    let rxsdt_raw_data: Arc<[u8]> = std::fs::read("kernel.acpi:rxsdt")
+        .expect("acpid: failed to read `kernel.acpi:rxsdt`")
         .into();
 
     let sdt = self::acpi::Sdt::new(rxsdt_raw_data)
@@ -113,11 +113,11 @@ fn daemon(daemon: redox_daemon::Daemon) -> ! {
 
     let acpi_context = self::acpi::AcpiContext::init(physaddrs_iter);
 
-    // TODO: I/O permission bitmap
-    unsafe { syscall::iopl(3) }.expect("acpid: failed to set I/O privilege level to Ring 3");
+    // TODO: I/O permission bitmap?
+    common::acquire_port_io_rights().expect("acpid: failed to set I/O privilege level to Ring 3");
 
-    let shutdown_pipe = File::open("kernel/acpi:kstop")
-        .expect("acpid: failed to open `kernel/acpi:kstop`");
+    let shutdown_pipe = File::open("kernel.acpi:kstop")
+        .expect("acpid: failed to open `kernel.acpi:kstop`");
 
     let mut event_queue = OpenOptions::new()
         .write(true)
@@ -136,7 +136,7 @@ fn daemon(daemon: redox_daemon::Daemon) -> ! {
 
     daemon.ready().expect("acpid: failed to notify parent");
 
-    syscall::setrens(0, 0).expect("acpid: failed to enter null namespace");
+    libredox::call::setrens(0, 0).expect("acpid: failed to enter null namespace");
 
     let _ = event_queue.write(&Event {
         id: shutdown_pipe.as_raw_fd() as usize,

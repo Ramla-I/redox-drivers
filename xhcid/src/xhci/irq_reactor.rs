@@ -14,7 +14,7 @@ use log::{debug, error, info, warn, trace};
 use futures::Stream;
 use syscall::Io;
 
-use event::{Event, EventQueue};
+use event::{Event, EventQueue, RawEventQueue};
 
 use super::Xhci;
 use super::doorbell::Doorbell;
@@ -66,7 +66,7 @@ impl RingId {
 #[derive(Clone, Copy, Debug)]
 pub enum StateKind {
     CommandCompletion { phys_ptr: u64 },
-    Transfer { phys_ptr: u64, ring_id: RingId },
+    Transfer { first_phys_ptr: u64, last_phys_ptr: u64, ring_id: RingId },
     Other(TrbType),
 }
 
@@ -146,12 +146,13 @@ impl IrqReactor {
         debug!("Running IRQ reactor with IRQ file and event queue");
 
         let hci_clone = Arc::clone(&self.hci);
-        let mut event_queue = EventQueue::<()>::new().expect("xhcid irq_reactor: failed to create IRQ event queue");
+        let mut event_queue = RawEventQueue::new().expect("xhcid irq_reactor: failed to create IRQ event queue");
         let irq_fd = self.irq_file.as_ref().unwrap().as_raw_fd();
+        event_queue.subscribe(irq_fd as usize, 0, event::EventFlags::READ).unwrap();
 
         let mut event_trb_index = { hci_clone.primary_event_ring.lock().unwrap().ring.next_index() };
 
-        event_queue.add(irq_fd, move |_| -> io::Result<Option<()>> {
+        for _event in event_queue {
             trace!("IRQ event queue notified");
             let mut buffer = [0u8; 8];
 
@@ -160,7 +161,7 @@ impl IrqReactor {
             if !self.hci.received_irq() {
                 // continue only when an IRQ to this device was received
                 trace!("no interrupt pending");
-                return Ok(None);
+                break;
             }
 
             trace!("IRQ reactor received an IRQ");
@@ -173,13 +174,13 @@ impl IrqReactor {
 
             let mut count = 0;
 
-            'trb_loop: loop {
+            loop {
                 let event_trb = &mut event_ring.ring.trbs[event_trb_index];
 
                 if event_trb.completion_code() == TrbCompletionCode::Invalid as u8 {
                     if count == 0 { warn!("xhci: Received interrupt, but no event was found in the event ring. Ignoring interrupt.") }
                     // no more events were found, continue the loop
-                    return Ok(None);
+                    return;
                 } else { count += 1 }
 
                 trace!("Found event TRB type {}: {:?}", event_trb.trb_type(), event_trb);
@@ -187,7 +188,7 @@ impl IrqReactor {
                 if self.check_event_ring_full(event_trb.clone()) {
                     info!("Had to resize event TRB, retrying...");
                     hci_clone.event_handler_finished();
-                    return Ok(None);
+                    return;
                 }
 
                 self.handle_requests();
@@ -199,8 +200,7 @@ impl IrqReactor {
 
                 event_trb_index = event_ring.ring.next_index();
             }
-        }).expect("xhcid: failed to catch irq events");
-        event_queue.run().expect("xhcid: failed to run IRQ event queue");
+        }
     }
     fn update_erdp(&self, event_ring: &EventRing) {
         let dequeue_pointer_and_dcs = event_ring.erdp();
@@ -209,7 +209,8 @@ impl IrqReactor {
 
         trace!("Updated ERDP to {:#0x}", dequeue_pointer);
 
-        self.hci.run.lock().unwrap().ints[0].erdp.write(dequeue_pointer);
+        self.hci.run.lock().unwrap().ints[0].erdp_low.write(dequeue_pointer as u32);
+        self.hci.run.lock().unwrap().ints[0].erdp_high.write((dequeue_pointer >> 32) as u32);
     }
     fn handle_requests(&mut self) {
         self.states.extend(self.receiver.try_iter().inspect(|req| trace!("Received request: {:X?}", req)));
@@ -258,32 +259,42 @@ impl IrqReactor {
                     }
                 }
 
-                StateKind::Transfer { phys_ptr, ring_id } if trb.trb_type() == TrbType::Transfer as u8 => {
+                StateKind::Transfer { first_phys_ptr, last_phys_ptr, ring_id } if trb.trb_type() == TrbType::Transfer as u8 => {
                     if let Some(src_trb) = trb.transfer_event_trb_pointer().map(|ptr| self.hci.get_transfer_trb(ptr, ring_id)).flatten() {
-                        if trb.transfer_event_trb_pointer() == Some(phys_ptr) {
-                            // Give the source transfer TRB together with the event TRB, to the future.
-
-                            let state = self.states.remove(index);
-                            *state.message.lock().unwrap() = Some(NextEventTrb {
-                                src_trb: Some(src_trb),
-                                event_trb: trb.clone(),
-                            });
-                            state.waker.wake();
-                            return;
-                        } else if trb.transfer_event_trb_pointer().is_none() {
-                            // Ring Overrun, Ring Underrun, or Virtual Function Event Ring Full.
-                            //
-                            // These errors are caused when either an isoch transfer that shall write data, doesn't
-                            // have any data since the ring is empty, or if an isoch receive is impossible due to a
-                            // full ring. The Virtual Function Event Ring Full is only for Virtual Machine
-                            // Managers, and since this isn't implemented yet, they are irrelevant.
-                            //
-                            // The best solution here is to differentiate between isoch transfers (and
-                            // virtual function event rings when virtualization gets implemented), with
-                            // regular commands and transfers, and send the error TRB to all of them, or
-                            // possibly an error code wrapped in a Result.
-                            self.acknowledge_failed_transfer_trbs(trb);
-                            return;
+                        match trb.transfer_event_trb_pointer() {
+                            Some(phys_ptr) => {
+                                let matches = if first_phys_ptr <= last_phys_ptr {
+                                    phys_ptr >= first_phys_ptr && phys_ptr <= last_phys_ptr
+                                } else {
+                                    // Handle ring buffer wrap
+                                    phys_ptr >= first_phys_ptr || phys_ptr <= last_phys_ptr
+                                };
+                                if matches {
+                                    // Give the source transfer TRB together with the event TRB, to the future.
+                                    let state = self.states.remove(index);
+                                    *state.message.lock().unwrap() = Some(NextEventTrb {
+                                        src_trb: Some(src_trb),
+                                        event_trb: trb.clone(),
+                                    });
+                                    state.waker.wake();
+                                    return;
+                                }
+                            },
+                            None => {
+                                // Ring Overrun, Ring Underrun, or Virtual Function Event Ring Full.
+                                //
+                                // These errors are caused when either an isoch transfer that shall write data, doesn't
+                                // have any data since the ring is empty, or if an isoch receive is impossible due to a
+                                // full ring. The Virtual Function Event Ring Full is only for Virtual Machine
+                                // Managers, and since this isn't implemented yet, they are irrelevant.
+                                //
+                                // The best solution here is to differentiate between isoch transfers (and
+                                // virtual function event rings when virtualization gets implemented), with
+                                // regular commands and transfers, and send the error TRB to all of them, or
+                                // possibly an error code wrapped in a Result.
+                                self.acknowledge_failed_transfer_trbs(trb);
+                                return;
+                            }
                         }
                     }
                 }
@@ -444,19 +455,21 @@ impl Xhci {
 
         Some(function(ring_ref))
     }
-    pub fn next_transfer_event_trb(&self, ring_id: RingId, ring: &Ring, trb: &Trb, doorbell: EventDoorbell) -> impl Future<Output = NextEventTrb> + Send + Sync + 'static {
-        if ! trb.is_transfer_trb() {
-            panic!("Invalid TRB type given to next_transfer_event_trb(): {} (TRB {:?}. Expected transfer TRB.", trb.trb_type(), trb)
+    pub fn next_transfer_event_trb(&self, ring_id: RingId, ring: &Ring, first_trb: &Trb, last_trb: &Trb, doorbell: EventDoorbell) -> impl Future<Output = NextEventTrb> + Send + Sync + 'static {
+        if ! last_trb.is_transfer_trb() {
+            panic!("Invalid TRB type given to next_transfer_event_trb(): {} (TRB {:?}. Expected transfer TRB.", last_trb.trb_type(), last_trb)
         }
 
-        let is_isoch_or_vf = trb.trb_type() == TrbType::Isoch as u8;
-        let phys_ptr = ring.trb_phys_ptr(self.cap.ac64(), trb);
+        let is_isoch_or_vf = last_trb.trb_type() == TrbType::Isoch as u8;
+        let first_phys_ptr = ring.trb_phys_ptr(self.cap.ac64(), first_trb);
+        let last_phys_ptr = ring.trb_phys_ptr(self.cap.ac64(), last_trb);
         EventTrbFuture::Pending {
             state: FutureState {
                 is_isoch_or_vf,
                 state_kind: StateKind::Transfer {
                     ring_id,
-                    phys_ptr,
+                    first_phys_ptr,
+                    last_phys_ptr,
                 },
                 message: Arc::new(Mutex::new(None)),
             },

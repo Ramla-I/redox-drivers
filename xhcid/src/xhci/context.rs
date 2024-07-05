@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 
 use log::debug;
+use syscall::PAGE_SIZE;
 use syscall::error::Result;
-use syscall::io::{Dma, Io, Mmio};
+use syscall::io::{Io, Mmio};
+
+use common::dma::Dma;
 
 use super::Xhci;
 use super::ring::Ring;
@@ -164,28 +167,30 @@ impl StreamContextArray {
 
 #[repr(packed)]
 pub struct ScratchpadBufferEntry {
-    pub value: Mmio<u64>,
+    pub value_low: Mmio<u32>,
+    pub value_high: Mmio<u32>,
 }
 impl ScratchpadBufferEntry {
     pub fn set_addr(&mut self, addr: u64) {
-        self.value.write(addr);
+        self.value_low.write(addr as u32);
+        self.value_high.write((addr >> 32) as u32);
     }
 }
 
 pub struct ScratchpadBufferArray {
     pub entries: Dma<[ScratchpadBufferEntry]>,
-    pub pages: Vec<usize>,
+    pub pages: Vec<Dma<[u8; PAGE_SIZE]>>,
 }
 impl ScratchpadBufferArray {
-    pub fn new(ac64: bool, page_size: usize, entries: u16) -> Result<Self> {
+    pub fn new(ac64: bool, entries: u16) -> Result<Self> {
         let mut entries = unsafe { Xhci::alloc_dma_zeroed_unsized_raw(ac64, entries as usize)? };
 
-        let pages = entries.iter_mut().map(|entry: &mut ScratchpadBufferEntry| -> Result<usize> {
-            let pointer = unsafe { syscall::physalloc(page_size)? };
-            assert_eq!((pointer as u64) & 0xFFFF_FFFF_FFFF_F000, pointer as u64, "physically allocated pointer (physalloc) wasn't 4k page-aligned");
-            entry.set_addr(pointer as u64);
-            Ok(pointer)
-        }).collect::<Result<Vec<usize>, _>>()?;
+        let pages = entries.iter_mut().map(|entry: &mut ScratchpadBufferEntry| -> Result<_, syscall::Error> {
+            let dma = unsafe { Dma::<[u8; PAGE_SIZE]>::zeroed()?.assume_init() };
+            assert_eq!(dma.physical() % PAGE_SIZE, 0);
+            entry.set_addr(dma.physical() as u64);
+            Ok(dma)
+        }).collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             entries,

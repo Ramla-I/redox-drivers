@@ -1,54 +1,69 @@
-use std::fmt;
+use std::convert::TryInto;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
+// This type is used instead of [pci_types::Bar] in the driver interface as the
+// latter can't be serialized and is missing the convenience functions of [PciBar].
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PciBar {
     None,
-    Memory32(u32),
-    Memory64(u64),
-    Port(u16)
+    Memory32 { addr: u32, size: u32 },
+    Memory64 { addr: u64, size: u64 },
+    Port(u16),
 }
 
 impl PciBar {
+    pub fn display(&self) -> String {
+        match self {
+            PciBar::None => format!("<none>"),
+            PciBar::Memory32 { addr, .. } => format!("{addr:08X}"),
+            PciBar::Memory64 { addr, .. } => format!("{addr:016X}"),
+            PciBar::Port(port) => format!("P{port:04X}"),
+        }
+    }
+
     pub fn is_none(&self) -> bool {
         match self {
             &PciBar::None => true,
             _ => false,
         }
     }
-}
 
-impl From<u32> for PciBar {
-    fn from(bar: u32) -> Self {
-        if bar & 0xFFFFFFFC == 0 {
-            PciBar::None
-        } else if bar & 1 == 0 {
-            match (bar >> 1) & 3 {
-                0 => {
-                    PciBar::Memory32(bar & 0xFFFFFFF0)
-                },
-                2 => {
-                    PciBar::Memory64((bar & 0xFFFFFFF0) as u64)
-                },
-                other => {
-                    log::warn!("unsupported PCI memory type {}", other);
-                    PciBar::None
-                },
+    pub fn expect_port(&self) -> u16 {
+        match *self {
+            PciBar::Port(port) => port,
+            PciBar::Memory32 { .. } | PciBar::Memory64 { .. } => {
+                panic!("expected port BAR, found memory BAR");
             }
-        } else {
-            PciBar::Port((bar & 0xFFFC) as u16)
+            PciBar::None => panic!("expected BAR to exist"),
         }
     }
-}
 
-impl fmt::Display for PciBar {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            &PciBar::Memory32(address) => write!(f, "{:>08X}", address),
-            &PciBar::Memory64(address) => write!(f, "{:>016X}", address),
-            &PciBar::Port(address) => write!(f, "{:>04X}", address),
-            &PciBar::None => write!(f, "None")
+    pub fn expect_mem(&self) -> (usize, usize) {
+        match *self {
+            PciBar::Memory32 { addr, size } => (addr as usize, size as usize),
+            PciBar::Memory64 { addr, size } => (
+                addr.try_into()
+                    .expect("conversion from 64bit BAR to usize failed"),
+                size.try_into()
+                    .expect("conversion from 64bit BAR size to usize failed"),
+            ),
+            PciBar::Port(_) => panic!("expected memory BAR, found port BAR"),
+            PciBar::None => panic!("expected BAR to exist"),
         }
+    }
+
+    pub unsafe fn physmap_mem(&self, driver: &str) -> *mut () {
+        let (bar, bar_size) = self.expect_mem();
+        unsafe {
+            common::physmap(
+                bar,
+                bar_size,
+                common::Prot::RW,
+                // FIXME once the kernel supports this use write-through for prefetchable BAR
+                common::MemoryType::Uncacheable,
+            )
+        }
+        .unwrap_or_else(|err| panic!("{driver}: failed to map BAR at {bar:016X}: {err}"))
     }
 }

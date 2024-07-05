@@ -5,8 +5,6 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::{fmt, mem};
 
-use syscall::flag::PhysmapFlags;
-
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use syscall::io::{Io, Pio};
 
@@ -106,8 +104,8 @@ impl PhysmapGuard {
     fn map(page: usize, page_count: usize) -> std::io::Result<Self> {
         let size = page_count * PAGE_SIZE;
         let virt = unsafe {
-            syscall::call::physmap(page, size, PhysmapFlags::empty())
-                .map_err(|error| std::io::Error::from_raw_os_error(error.errno))?
+            common::physmap(page, size, common::Prot::RO, common::MemoryType::default())
+                .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))?
         };
 
         Ok(Self {
@@ -126,7 +124,7 @@ impl Deref for PhysmapGuard {
 impl Drop for PhysmapGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = syscall::funmap(self.virt as usize, self.size);
+            let _ = libredox::call::munmap(self.virt as *mut (), self.size);
         }
     }
 }
@@ -193,7 +191,7 @@ impl Sdt {
 
         while left > 0 {
             let to_copy = std::cmp::min(left, length_per_iteration);
-            let additional_pages = PhysmapGuard::map(offset, length_per_iteration)?;
+            let additional_pages = PhysmapGuard::map(offset, to_copy.div_ceil(PAGE_SIZE))?;
 
             loaded.extend(&additional_pages[..to_copy]);
 

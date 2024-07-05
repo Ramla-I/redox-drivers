@@ -14,7 +14,7 @@ impl DrhdPage {
 
         // TODO: Uncachable? Can reads have side-effects?
         let virt = unsafe {
-            syscall::physmap(base_phys, crate::acpi::PAGE_SIZE, syscall::PhysmapFlags::PHYSMAP_WRITE)?
+            common::physmap(base_phys, crate::acpi::PAGE_SIZE, common::Prot::RO, common::MemoryType::default())?
         } as *mut Drhd;
 
         Ok(Self { virt })
@@ -35,7 +35,7 @@ impl DerefMut for DrhdPage {
 impl Drop for DrhdPage {
     fn drop(&mut self) {
         unsafe {
-            let _ = syscall::funmap(self.virt as usize, crate::acpi::PAGE_SIZE);
+            let _ = libredox::call::munmap(self.virt.cast(), crate::acpi::PAGE_SIZE);
         }
     }
 }

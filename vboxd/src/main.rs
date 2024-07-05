@@ -1,18 +1,16 @@
 //#![deny(warnings)]
 
-extern crate event;
-extern crate orbclient;
-extern crate syscall;
-
-use event::EventQueue;
-use std::{env, mem};
+use event::{user_data, EventQueue};
+use std::{iter, mem};
 use std::os::unix::io::AsRawFd;
 use std::fs::File;
 use std::io::{Result, Read, Write};
 
-use syscall::call::iopl;
-use syscall::flag::{EventFlags, PHYSMAP_NO_CACHE, PHYSMAP_WRITE};
-use syscall::io::{Dma, Io, Mmio, Pio};
+use pcid_interface::{PciBar, PcidServerHandle};
+use syscall::flag::EventFlags;
+use syscall::io::{Io, Mmio, Pio};
+
+use common::dma::Dma;
 
 use crate::bga::Bga;
 
@@ -182,34 +180,33 @@ impl VboxGuestInfo {
 }
 
 fn main() {
-    let mut args = env::args().skip(1);
+    let mut pcid_handle =
+        PcidServerHandle::connect_default().expect("vboxd: failed to setup channel to pcid");
+    let pci_config = pcid_handle
+        .fetch_config()
+        .expect("vboxd: failed to fetch config");
 
-    let mut name = args.next().expect("vboxd: no name provided");
+    let mut name = pci_config.func.name();
     name.push_str("_vbox");
 
-    let bar0_str = args.next().expect("vboxd: no address provided");
-    let bar0 = usize::from_str_radix(&bar0_str, 16).expect("vboxd: failed to parse address");
+    let bar0 = pci_config.func.bars[0].expect_port();
 
-    let bar1_str = args.next().expect("vboxd: no address provided");
-    let bar1 = usize::from_str_radix(&bar1_str, 16).expect("vboxd: failed to parse address");
+    let bar1 = &pci_config.func.bars[1];
 
-    let irq_str = args.next().expect("vboxd: no irq provided");
-    let irq = irq_str.parse::<u8>().expect("vboxd: failed to parse irq");
+    let irq = pci_config.func.legacy_interrupt_line.expect("vboxd: no legacy interrupts supported");
 
-    print!("{}", format!(" + VirtualBox {} on: {:X}, {:X}, IRQ {}\n", name, bar0, bar1, irq));
+    println!(" + VirtualBox {}", pci_config.func.display());
 
     // Daemonize
     redox_daemon::Daemon::new(move |daemon| {
-        daemon.ready().expect("failed to signal readiness");
-
-        unsafe { iopl(3).expect("vboxd: failed to get I/O permission"); };
+        common::acquire_port_io_rights().expect("vboxd: failed to get I/O permission");
 
         let mut width = 0;
         let mut height = 0;
-        let mut display_opt = File::open("display:input").ok();
+        let mut display_opt = File::open("inputd:producer").ok();
         if let Some(ref display) = display_opt {
             let mut buf: [u8; 4096] = [0; 4096];
-            if let Ok(count) = syscall::fpath(display.as_raw_fd() as usize, &mut buf) {
+            if let Ok(count) = libredox::call::fpath(display.as_raw_fd() as usize, &mut buf) {
                 let path = unsafe { String::from_utf8_unchecked(Vec::from(&buf[..count])) };
                 let res = path.split(":").nth(1).unwrap_or("");
                 width = res.split("/").nth(1).unwrap_or("").parse::<u32>().unwrap_or(0);
@@ -217,10 +214,10 @@ fn main() {
             }
         }
 
-        let mut irq_file = File::open(format!("irq:{}", irq)).expect("vboxd: failed to open IRQ file");
+        let mut irq_file = irq.irq_handle("vboxd");
 
         let mut port = Pio::<u32>::new(bar0 as u16);
-        let address = unsafe { syscall::physmap(bar1, 4096, PHYSMAP_WRITE | PHYSMAP_NO_CACHE).expect("vboxd: failed to map address") };
+        let address = unsafe { bar1.physmap_mem("vboxd") };
         {
             let vmmdev = unsafe { &mut *(address as *mut VboxVmmDev) };
 
@@ -239,21 +236,31 @@ fn main() {
 
             vmmdev.guest_events.write(VBOX_EVENT_DISPLAY | VBOX_EVENT_MOUSE);
 
-            let mut event_queue = EventQueue::<()>::new().expect("vboxd: failed to create event queue");
+            user_data! {
+                enum Source {
+                    Irq,
+                }
+            }
 
-            syscall::setrens(0, 0).expect("vboxd: failed to enter null namespace");
+            let event_queue = EventQueue::<Source>::new().expect("vboxd: Could not create event queue.");
+            event_queue.subscribe(irq_file.as_raw_fd() as usize, Source::Irq, event::EventFlags::READ).unwrap();
+
+            daemon.ready().expect("failed to signal readiness");
+
+            libredox::call::setrens(0, 0).expect("vboxd: failed to enter null namespace");
 
             let mut bga = Bga::new();
             let get_mouse = VboxGetMouse::new().expect("vboxd: failed to map GetMouse");
             let display_change = VboxDisplayChange::new().expect("vboxd: failed to map DisplayChange");
             let ack_events = VboxAckEvents::new().expect("vboxd: failed to map AckEvents");
-            event_queue.add(irq_file.as_raw_fd(), move |_event| -> Result<Option<()>> {
+
+            for Source::Irq in iter::once(Source::Irq).chain(event_queue.map(|e| e.expect("vboxd: failed to get next event").user_data)) {
                 let mut irq = [0; 8];
-                if irq_file.read(&mut irq)? >= irq.len() {
+                if irq_file.read(&mut irq).unwrap() >= irq.len() {
                     let host_events = vmmdev.host_events.read();
                     if host_events != 0 {
                         port.write(ack_events.physical() as u32);
-                        irq_file.write(&irq)?;
+                        irq_file.write(&irq).unwrap();
 
                         if host_events & VBOX_EVENT_DISPLAY == VBOX_EVENT_DISPLAY {
                             port.write(display_change.physical() as u32);
@@ -266,8 +273,8 @@ fn main() {
                                     println!("Display {}, {}", width, height);
                                     bga.set_size(width as u16, height as u16);
                                     let _ = display.write(&orbclient::ResizeEvent {
-                                        width: width,
-                                        height: height,
+                                        width,
+                                        height,
                                     }.to_event());
                                 }
                             }
@@ -286,15 +293,7 @@ fn main() {
                         }
                     }
                 }
-                Ok(None)
-            }).expect("vboxd: failed to poll irq");
-
-            event_queue.trigger_all(event::Event {
-                fd: 0,
-                flags: EventFlags::empty()
-            }).expect("vboxd: failed to trigger events");
-
-            event_queue.run().expect("vboxd: failed to run event loop");
+            }
         }
 
         std::process::exit(0);

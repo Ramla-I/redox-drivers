@@ -14,7 +14,7 @@ use thiserror::Error;
 
 pub use crate::usb::{EndpointTy, ENDP_ATTR_TY_MASK};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConfigureEndpointsReq {
     /// Index into the configuration descriptors of the device descriptor.
     pub config_desc: u8,
@@ -112,9 +112,9 @@ impl EndpDesc {
     pub fn ty(self) -> EndpointTy {
         match self.attributes & ENDP_ATTR_TY_MASK {
             0 => EndpointTy::Ctrl,
-            1 => EndpointTy::Interrupt,
+            1 => EndpointTy::Isoch,
             2 => EndpointTy::Bulk,
-            3 => EndpointTy::Isoch,
+            3 => EndpointTy::Interrupt,
             _ => unreachable!(),
         }
     }
@@ -156,7 +156,8 @@ impl EndpDesc {
         self.ssc.is_some()
     }
     pub fn is_superspeedplus(&self) -> bool {
-        todo!()
+        log::warn!("TODO: is_superspeedplus not implemented, defaulting to false");
+        false
     }
     fn interrupt_usage_bits(&self) -> u8 {
         assert!(self.is_interrupt());
@@ -471,7 +472,7 @@ impl XhciClientHandle {
             value,
             index,
             length,
-            transfers_data: true,
+            transfers_data: !matches!(data, DeviceReqData::NoData),
         };
         let json = serde_json::to_vec(&req)?;
 

@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 use std::fmt::LowerHex;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
-use syscall::{Io, PhysmapFlags, Pio, PAGE_SIZE};
+use syscall::{Io, Pio, PAGE_SIZE};
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 const OFFSET_MASK: usize = PAGE_SIZE - 1;
@@ -16,9 +16,9 @@ struct MappedPage {
 impl MappedPage {
     fn new(phys_page: usize) -> std::io::Result<Self> {
         let virt_page = unsafe {
-            syscall::physmap(phys_page, PAGE_SIZE, PhysmapFlags::empty())
-                .map_err(|error| std::io::Error::from_raw_os_error(error.errno))?
-        };
+            common::physmap(phys_page, PAGE_SIZE, common::Prot::RO, common::MemoryType::default())
+                .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))?
+        } as usize;
         Ok(Self {
             phys_page,
             virt_page,
@@ -29,7 +29,7 @@ impl MappedPage {
 impl Drop for MappedPage {
     fn drop(&mut self) {
         log::trace!("Drop page {:#x}", self.phys_page);
-        if let Err(e) = unsafe { syscall::funmap(self.virt_page, PAGE_SIZE) } {
+        if let Err(e) = unsafe { libredox::call::munmap(self.virt_page as *mut (), PAGE_SIZE) } {
             log::error!("funmap (phys): {:?}", e);
         }
     }
@@ -212,7 +212,7 @@ impl aml::Handler for AmlPhysMemHandler {
         }
     }
 
-    // Pio must be enabled via syscall::iopl(3)
+    // Pio must be enabled via syscall::iopl
     fn read_io_u8(&self, port: u16) -> u8 {
         Pio::<u8>::new(port).read()
     }

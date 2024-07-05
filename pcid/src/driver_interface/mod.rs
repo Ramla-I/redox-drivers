@@ -1,63 +1,95 @@
+use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::{env, io};
 
 use std::os::unix::io::{FromRawFd, RawFd};
 
-use serde::{Serialize, Deserialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
-pub use crate::pci::{PciBar, PciHeader};
+pub use crate::pci::cap::Capability;
 pub use crate::pci::msi;
+pub use crate::pci::{FullDeviceId, PciAddress, PciBar};
 
 pub mod irq_helpers;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum LegacyInterruptPin {
-    /// INTa#
-    IntA = 1,
-    /// INTb#
-    IntB = 2,
-    /// INTc#
-    IntC = 3,
-    /// INTd#
-    IntD = 4,
+pub struct LegacyInterruptLine(pub(crate) u8);
+
+impl LegacyInterruptLine {
+    /// Get an IRQ handle for this interrupt line.
+    pub fn irq_handle(self, driver: &str) -> File {
+        File::open(format!("irq:{}", self.0))
+            .unwrap_or_else(|err| panic!("{driver}: failed to open IRQ file: {err}"))
+    }
+}
+
+impl fmt::Display for LegacyInterruptLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "PciAddress")]
+struct PciAddressDef {
+    #[serde(getter = "PciAddress::segment")]
+    segment: u16,
+    #[serde(getter = "PciAddress::bus")]
+    bus: u8,
+    #[serde(getter = "PciAddress::device")]
+    device: u8,
+    #[serde(getter = "PciAddress::function")]
+    function: u8,
+}
+
+impl From<PciAddressDef> for PciAddress {
+    fn from(value: PciAddressDef) -> Self {
+        PciAddress::new(value.segment, value.bus, value.device, value.function)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PciFunction {
-    /// Number of PCI bus
-    pub bus_num: u8,
-
-    /// Number of PCI device
-    pub dev_num: u8,
-
-    /// Number of PCI function
-    pub func_num: u8,
+    /// Address of the PCI function.
+    #[serde(with = "PciAddressDef")]
+    pub addr: PciAddress,
 
     /// PCI Base Address Registers
     pub bars: [PciBar; 6],
 
-    /// BAR sizes
-    pub bar_sizes: [u32; 6],
-
     /// Legacy IRQ line: It's the responsibility of pcid to make sure that it be mapped in either
     /// the I/O APIC or the 8259 PIC, so that the subdriver can map the interrupt vector directly.
     /// The vector to map is always this field, plus 32.
-    pub legacy_interrupt_line: u8,
+    /// If INTx# interrupts aren't supported at all this is `None`.
+    pub legacy_interrupt_line: Option<LegacyInterruptLine>,
 
-    /// Legacy interrupt pin (INTx#), none if INTx# interrupts aren't supported at all.
-    pub legacy_interrupt_pin: Option<LegacyInterruptPin>,
-
-    /// Vendor ID
-    pub venid: u16,
-    /// Device ID
-    pub devid: u16,
+    /// All identifying information of the PCI function.
+    pub full_device_id: FullDeviceId,
 }
 impl PciFunction {
     pub fn name(&self) -> String {
-        format!("pci-{:>02X}.{:>02X}.{:>02X}", self.bus_num, self.dev_num, self.func_num)
+        // FIXME stop replacing : with - once it is a valid character in scheme names
+        format!("pci-{}", self.addr).replace(':', "-")
+    }
+
+    pub fn display(&self) -> String {
+        let mut string = self.name();
+        let mut first = true;
+        for (i, bar) in self.bars.iter().enumerate() {
+            if !bar.is_none() {
+                if first {
+                    first = false;
+                    string.push_str(" on:");
+                }
+                string.push_str(&format!(" {i}={}", bar.display()));
+            }
+        }
+        if let Some(irq) = self.legacy_interrupt_line {
+            string.push_str(&format!(" IRQ: {irq}"));
+        }
+        string
     }
 }
 
@@ -91,11 +123,11 @@ pub enum PciFeature {
     MsiX,
 }
 impl PciFeature {
-    pub fn is_msi(&self) -> bool {
-        if let &Self::Msi = self { true } else { false }
+    pub fn is_msi(self) -> bool {
+        if let Self::Msi = self { true } else { false }
     }
-    pub fn is_msix(&self) -> bool {
-        if let &Self::MsiX = self { true } else { false }
+    pub fn is_msix(self) -> bool {
+        if let Self::MsiX = self { true } else { false }
     }
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,22 +163,12 @@ pub struct MsiSetFeatureInfo {
     /// is the log2 of the interrupt vectors, minus one. Can only be 0b000..=0b101.
     pub multi_message_enable: Option<u8>,
 
-    /// The system-specific message address, must be DWORD aligned.
+    /// The system-specific message address and data.
     ///
     /// The message address contains things like the CPU that will be targeted, at least on
-    /// x86_64.
-    pub message_address: Option<u32>,
-
-    /// The upper 32 bits of the 64-bit message address. Not guaranteed to exist, and is
-    /// reserved on x86_64 (currently).
-    pub message_upper_address: Option<u32>,
-
-    /// The message data, containing the actual interrupt vector (lower 8 bits), etc.
-    ///
-    /// The spec mentions that the lower N bits can be modified, where N is the multi message
-    /// enable, which means that the vector set here has to be aligned to that number, and that
-    /// all vectors in that range have to be allocated.
-    pub message_data: Option<u16>,
+    /// x86_64. The message data contains the actual interrupt vector (lower 8 bits) and
+    /// the kind of interrupt, at least on x86_64.
+    pub message_address_and_data: Option<msi::MsiAddrAndData>,
 
     /// A bitmap of the vectors that are masked. This field is not guaranteed (and not likely,
     /// at least according to the feature flags I got from QEMU), to exist.
@@ -169,8 +191,8 @@ pub enum SetFeatureInfo {
 #[non_exhaustive]
 pub enum PcidClientRequest {
     RequestConfig,
-    RequestHeader,
     RequestFeatures,
+    RequestCapabilities,
     EnableFeature(PciFeature),
     FeatureStatus(PciFeature),
     FeatureInfo(PciFeature),
@@ -189,8 +211,8 @@ pub enum PcidServerResponseError {
 #[derive(Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum PcidClientResponse {
+    Capabilities(Vec<Capability>),
     Config(SubdriverArguments),
-    Header(PciHeader),
     AllFeatures(Vec<(PciFeature, FeatureStatus)>),
     FeatureEnabled(PciFeature),
     FeatureStatus(PciFeature, FeatureStatus),
@@ -233,22 +255,19 @@ pub(crate) fn recv<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T> {
 }
 
 impl PcidServerHandle {
-    pub fn connect(pcid_to_client: RawFd, pcid_from_client: RawFd) -> Result<Self> {
-        Ok(Self {
-            pcid_to_client: unsafe { File::from_raw_fd(pcid_to_client) },
-            pcid_from_client: unsafe { File::from_raw_fd(pcid_from_client) },
-        })
-    }
     pub fn connect_default() -> Result<Self> {
         let pcid_to_client_fd = env::var("PCID_TO_CLIENT_FD")?.parse::<RawFd>().map_err(PcidClientHandleError::EnvValidityError)?;
         let pcid_from_client_fd = env::var("PCID_FROM_CLIENT_FD")?.parse::<RawFd>().map_err(PcidClientHandleError::EnvValidityError)?;
 
-        Self::connect(pcid_to_client_fd, pcid_from_client_fd)
+        Ok(Self {
+            pcid_to_client: unsafe { File::from_raw_fd(pcid_to_client_fd) },
+            pcid_from_client: unsafe { File::from_raw_fd(pcid_from_client_fd) },
+        })
     }
-    pub(crate) fn send(&mut self, req: &PcidClientRequest) -> Result<()> {
+    fn send(&mut self, req: &PcidClientRequest) -> Result<()> {
         send(&mut self.pcid_from_client, req)
     }
-    pub(crate) fn recv(&mut self) -> Result<PcidClientResponse> {
+    fn recv(&mut self) -> Result<PcidClientResponse> {
         recv(&mut self.pcid_to_client)
     }
     pub fn fetch_config(&mut self) -> Result<SubdriverArguments> {
@@ -258,13 +277,17 @@ impl PcidServerHandle {
             other => Err(PcidClientHandleError::InvalidResponse(other)),
         }
     }
-    pub fn fetch_header(&mut self) -> Result<PciHeader> {
-        self.send(&PcidClientRequest::RequestHeader)?;
+
+    pub fn get_capabilities(&mut self) -> Result<Vec<Capability>> {
+        self.send(&PcidClientRequest::RequestCapabilities)?;
+
         match self.recv()? {
-            PcidClientResponse::Header(a) => Ok(a),
+            PcidClientResponse::Capabilities(a) => Ok(a),
             other => Err(PcidClientHandleError::InvalidResponse(other)),
         }
     }
+
+    // FIXME turn into struct with bool fields
     pub fn fetch_all_features(&mut self) -> Result<Vec<(PciFeature, FeatureStatus)>> {
         self.send(&PcidClientRequest::RequestFeatures)?;
         match self.recv()? {
