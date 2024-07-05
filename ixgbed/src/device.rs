@@ -131,7 +131,7 @@ impl SchemeBlockMut for Intel8259x {
         data[..i].copy_from_slice(&buf[..i]);
 
             desc.read.cmd_type_len = IXGBE_ADVTXD_DCMD_EOP
-                | IXGBE_ADVTXD_DCMD_RS
+                | IXGBE_ADVTXD_DCMD_RS // Ramla: Setting RS for every packet
                 | IXGBE_ADVTXD_DCMD_IFCS
                 | IXGBE_ADVTXD_DCMD_DEXT
                 | IXGBE_ADVTXD_DTYP_DATA
@@ -401,7 +401,7 @@ impl Intel8259x {
 
         // enable CRC offloading
         self.write_flag(IXGBE_HLREG0, IXGBE_HLREG0_RXCRCSTRP);
-        self.write_flag(IXGBE_RDRXCTL, IXGBE_RDRXCTL_CRCSTRIP);
+        self.write_flag(IXGBE_RDRXCTL, IXGBE_RDRXCTL_CRCSTRIP); // Ramla reserved bits are not set
 
         // accept broadcast packets
         self.write_flag(IXGBE_FCTRL, IXGBE_FCTRL_BAM);
@@ -453,7 +453,7 @@ impl Intel8259x {
         }
 
         // required when not using DCB/VTd
-        self.write_reg(IXGBE_DTXMXSZRQ, 0xffff);
+        self.write_reg(IXGBE_DTXMXSZRQ, 0xffff);// Ramla: bug, bits 31:12 are reserved
         self.clear_flag(IXGBE_RTTDCS, IXGBE_RTTDCS_ARBDIS);
 
         // configure a single transmit queue/ring
@@ -475,7 +475,7 @@ impl Intel8259x {
         // there are no defines for this in ixgbe.rs for some reason
         // pthresh: 6:0, hthresh: 14:8, wthresh: 22:16
         txdctl &= !(0x3F | (0x3F << 8) | (0x3F << 16));
-        txdctl |= 36 | (8 << 8) | (4 << 16);
+        txdctl |= 36 | (8 << 8) | (4 << 16); // Ramla: setting wthresh
 
         self.write_reg(IXGBE_TXDCTL(i), txdctl);
 
@@ -565,7 +565,7 @@ impl Intel8259x {
     /// Enables or disables promisc mode of this device.
     fn set_promisc(&self, enabled: bool) {
         if enabled {
-            self.write_flag(IXGBE_FCTRL, IXGBE_FCTRL_MPE | IXGBE_FCTRL_UPE);
+            self.write_flag(IXGBE_FCTRL, IXGBE_FCTRL_MPE | IXGBE_FCTRL_UPE); //Ramla: bug, setting fctrl without disable. DPDK Bug 21
         } else {
             self.clear_flag(IXGBE_FCTRL, IXGBE_FCTRL_MPE | IXGBE_FCTRL_UPE);
         }
